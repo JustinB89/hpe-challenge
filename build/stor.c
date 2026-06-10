@@ -51,10 +51,10 @@ static void die_invalid(void) {
 #define SALT_LEN       16
 #define IV_LEN         12
 #define TAG_LEN        16
-#define PBKDF2_ITER    10000
+#define PBKDF2_ITER    200000   /* raise offline brute-force cost vs a weak secret */
 
-#define MAX_USERNAME   63
-#define MAX_FILENAME   63
+#define MAX_USERNAME   255   /* fits the u8 length prefix; spec sets no limit */
+#define MAX_FILENAME   255
 #define MAX_CONTENT    (64u * 1024u * 1024u)
 
 static const uint8_t KEY_VERIFY_PT[8] = {'S','T','O','R','K','E','Y','!'};
@@ -108,8 +108,11 @@ static int gcm_encrypt(const uint8_t key[KEY_LEN],
     if (EVP_EncryptInit_ex(ctx, NULL, NULL, key, iv) != 1) goto done;
     if (aad && aad_len > 0 &&
         EVP_EncryptUpdate(ctx, NULL, &n, aad, aad_len) != 1) goto done;
-    if (EVP_EncryptUpdate(ctx, ct, &n, pt, pt_len) != 1) goto done;
-    total = n;
+    /* Skip the data update for empty content: some OpenSSL builds reject a
+       NULL/zero-length input here, which would break empty-file round-trips. */
+    if (pt_len > 0 &&
+        EVP_EncryptUpdate(ctx, ct, &n, pt, pt_len) != 1) goto done;
+    total = (pt_len > 0) ? n : 0;
     if (EVP_EncryptFinal_ex(ctx, ct + total, &n) != 1) goto done;
     total += n;
     if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, TAG_LEN, tag) != 1) goto done;
@@ -136,8 +139,10 @@ static int gcm_decrypt(const uint8_t key[KEY_LEN],
     if (EVP_DecryptInit_ex(ctx, NULL, NULL, key, iv) != 1) goto done;
     if (aad && aad_len > 0 &&
         EVP_DecryptUpdate(ctx, NULL, &n, aad, aad_len) != 1) goto done;
-    if (EVP_DecryptUpdate(ctx, pt, &n, ct, ct_len) != 1) goto done;
-    total = n;
+    /* Mirror the encrypt side: skip the data update for empty ciphertext. */
+    if (ct_len > 0 &&
+        EVP_DecryptUpdate(ctx, pt, &n, ct, ct_len) != 1) goto done;
+    total = (ct_len > 0) ? n : 0;
     if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, TAG_LEN,
                              (void *)(uintptr_t)tag) != 1) goto done;
     if (EVP_DecryptFinal_ex(ctx, pt + total, &n) <= 0) goto done;
@@ -210,9 +215,13 @@ static void bw_init(BufW *b) { b->buf = NULL; b->len = b->cap = 0; }
 
 static void bw_grow(BufW *b, size_t need) {
     size_t nc;
+    if (need > SIZE_MAX - b->len) die_invalid();   /* len+need would overflow */
     if (b->len + need <= b->cap) return;
     nc = b->cap ? b->cap * 2 : 256;
-    while (nc < b->len + need) nc *= 2;
+    while (nc < b->len + need) {
+        if (nc > SIZE_MAX / 2) { nc = b->len + need; break; }   /* no overflow */
+        nc *= 2;
+    }
     b->buf = xrealloc(b->buf, nc);
     b->cap = nc;
 }
