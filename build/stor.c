@@ -91,9 +91,13 @@ static int derive_key(const char *pw, const uint8_t *salt,
                               KEY_LEN, out) == 1 ? 0 : -1;
 }
 
-/* Returns ciphertext length (== pt_len) on success, -1 on error. */
+/* AES-256-GCM encrypt. The AAD (associated data) is authenticated but not
+   encrypted; here it binds each ciphertext to the record it belongs to so a
+   blob cannot be relocated within enc.db without failing the tag check.
+   Returns ciphertext length (== pt_len) on success, -1 on error. */
 static int gcm_encrypt(const uint8_t key[KEY_LEN],
                        const uint8_t iv[IV_LEN],
+                       const uint8_t *aad, int aad_len,
                        const uint8_t *pt, int pt_len,
                        uint8_t *ct, uint8_t tag[TAG_LEN]) {
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
@@ -102,6 +106,8 @@ static int gcm_encrypt(const uint8_t key[KEY_LEN],
     if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1) goto done;
     if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, IV_LEN, NULL) != 1) goto done;
     if (EVP_EncryptInit_ex(ctx, NULL, NULL, key, iv) != 1) goto done;
+    if (aad && aad_len > 0 &&
+        EVP_EncryptUpdate(ctx, NULL, &n, aad, aad_len) != 1) goto done;
     if (EVP_EncryptUpdate(ctx, ct, &n, pt, pt_len) != 1) goto done;
     total = n;
     if (EVP_EncryptFinal_ex(ctx, ct + total, &n) != 1) goto done;
@@ -113,9 +119,12 @@ done:
     return rc;
 }
 
-/* Returns plaintext length on success, -1 on auth failure or error. */
+/* Returns plaintext length on success, -1 on auth failure or error.
+   The same AAD supplied at encryption must be supplied here or the tag
+   check fails — this is what makes a relocated/forged record detectable. */
 static int gcm_decrypt(const uint8_t key[KEY_LEN],
                        const uint8_t iv[IV_LEN],
+                       const uint8_t *aad, int aad_len,
                        const uint8_t *ct, int ct_len,
                        const uint8_t tag[TAG_LEN],
                        uint8_t *pt) {
@@ -125,6 +134,8 @@ static int gcm_decrypt(const uint8_t key[KEY_LEN],
     if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1) goto done;
     if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, IV_LEN, NULL) != 1) goto done;
     if (EVP_DecryptInit_ex(ctx, NULL, NULL, key, iv) != 1) goto done;
+    if (aad && aad_len > 0 &&
+        EVP_DecryptUpdate(ctx, NULL, &n, aad, aad_len) != 1) goto done;
     if (EVP_DecryptUpdate(ctx, pt, &n, ct, ct_len) != 1) goto done;
     total = n;
     if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, TAG_LEN,
@@ -232,13 +243,15 @@ static void br_init(BufR *b, const uint8_t *buf, size_t len) {
     b->buf = buf; b->len = len; b->pos = 0;
 }
 
+/* Bounds checks are written as `need > remaining` (never `pos + need > len`)
+   so they cannot integer-overflow on the mandated 32-bit build. */
 static int br_u8(BufR *b, uint8_t *v) {
-    if (b->pos + 1 > b->len) return -1;
+    if (b->len - b->pos < 1) return -1;
     *v = b->buf[b->pos++]; return 0;
 }
 
 static int br_u32le(BufR *b, uint32_t *v) {
-    if (b->pos + 4 > b->len) return -1;
+    if (b->len - b->pos < 4) return -1;
     *v  = (uint32_t)b->buf[b->pos++];
     *v |= (uint32_t)b->buf[b->pos++] <<  8;
     *v |= (uint32_t)b->buf[b->pos++] << 16;
@@ -247,7 +260,7 @@ static int br_u32le(BufR *b, uint32_t *v) {
 }
 
 static int br_raw(BufR *b, void *p, size_t n) {
-    if (b->pos + n > b->len) return -1;
+    if (b->len - b->pos < n) return -1;   /* len >= pos invariant: no overflow */
     memcpy(p, b->buf + b->pos, n); b->pos += n; return 0;
 }
 
@@ -373,9 +386,9 @@ static int db_load(DB *db) {
 
     while (b.pos < b.len) {
         uint32_t type, size;
-        if (br_u32le(&b, &type) < 0) break;
+        if (br_u32le(&b, &type) < 0) goto err;   /* partial header = forgery */
         if (br_u32le(&b, &size) < 0) goto err;
-        if (b.pos + size > b.len) goto err;
+        if (size > b.len - b.pos) goto err;       /* overflow-safe */
 
         BufR rec;
         br_init(&rec, b.buf + b.pos, size);
@@ -384,6 +397,7 @@ static int db_load(DB *db) {
         if (type == REC_USER) {
             UserRec u;
             if (deser_user(&rec, &u) < 0) goto err;
+            if (rec.pos != rec.len) goto err;     /* trailing bytes = forgery */
             if (db->n_users >= db->cap_users) {
                 db->cap_users = db->cap_users ? db->cap_users * 2 : 4;
                 db->users = xrealloc(db->users,
@@ -393,16 +407,19 @@ static int db_load(DB *db) {
         } else if (type == REC_FILE) {
             FileRec fr;
             if (deser_file(&rec, &fr) < 0) goto err;
+            if (rec.pos != rec.len) { zfree(fr.ct, fr.ct_len); goto err; }
             if (db->n_files >= db->cap_files) {
                 db->cap_files = db->cap_files ? db->cap_files * 2 : 4;
                 db->files = xrealloc(db->files,
                                      (size_t)db->cap_files * sizeof(FileRec));
             }
             db->files[db->n_files++] = fr;
+        } else {
+            goto err;   /* unknown record type = forgery, not silently skipped */
         }
-        /* unknown types silently skipped */
     }
 
+    if (b.pos != b.len) goto err;   /* every byte must be accounted for */
     free(buf);
     return 0;
 err:
@@ -434,12 +451,28 @@ static void db_save(const DB *db) {
 /* Authentication                                                      */
 /* ------------------------------------------------------------------ */
 
-/* Returns derived key in dkey[] on success; calls die_invalid() on failure. */
+/* Build the per-file AAD: owner + 0x00 + filename. Binding both (with a
+   separator so "ab"/"c" != "a"/"bc") ties a ciphertext to exactly one
+   (owner, filename) slot, so a blob moved elsewhere in enc.db won't verify.
+   Returns the AAD length; out must hold MAX_USERNAME+1+MAX_FILENAME+1. */
+static int file_aad(const char *owner, const char *filename, uint8_t *out) {
+    size_t ol = strlen(owner), fl = strlen(filename);
+    memcpy(out, owner, ol);
+    out[ol] = 0x00;
+    memcpy(out + ol + 1, filename, fl);
+    return (int)(ol + 1 + fl);
+}
+
+/* Returns derived key in dkey[] on success; calls die_invalid() on failure.
+   The user token is authenticated with the username as AAD, so swapping a
+   user's salt/iv/tag/token block onto another username is detected. */
 static void auth_user(const UserRec *u, const char *key,
                       uint8_t dkey[KEY_LEN]) {
     uint8_t check_pt[8];
     if (derive_key(key, u->salt, dkey) < 0) { memset(dkey, 0, KEY_LEN); die_invalid(); }
-    if (gcm_decrypt(dkey, u->iv, u->check_ct, 8, u->tag, check_pt) < 0) {
+    if (gcm_decrypt(dkey, u->iv,
+                    (const uint8_t *)u->username, (int)strlen(u->username),
+                    u->check_ct, 8, u->tag, check_pt) < 0) {
         memset(dkey, 0, KEY_LEN); die_invalid();
     }
 }
@@ -463,7 +496,9 @@ static void cmd_register(DB *db, const char *username, const char *key) {
 
     uint8_t dkey[KEY_LEN];
     if (derive_key(key, u.salt, dkey) < 0) die_invalid();
-    if (gcm_encrypt(dkey, u.iv, KEY_VERIFY_PT, 8, u.check_ct, u.tag) < 0) {
+    if (gcm_encrypt(dkey, u.iv,
+                    (const uint8_t *)u.username, (int)strlen(u.username),
+                    KEY_VERIFY_PT, 8, u.check_ct, u.tag) < 0) {
         memset(dkey, 0, KEY_LEN); die_invalid();
     }
     memset(dkey, 0, KEY_LEN);
@@ -523,8 +558,12 @@ static void cmd_write(DB *db, const char *username, const char *key,
 
     if (RAND_bytes(iv, IV_LEN) != 1) { memset(dkey, 0, KEY_LEN); die_invalid(); }
 
+    uint8_t aad[MAX_USERNAME + 1 + MAX_FILENAME + 1];
+    int aad_len = file_aad(fr->owner, fr->filename, aad);
+
     ct = xmalloc(content_len > 0 ? content_len : 1);
-    ct_len = gcm_encrypt(dkey, iv, content, (int)content_len, ct, tag);
+    ct_len = gcm_encrypt(dkey, iv, aad, aad_len,
+                         content, (int)content_len, ct, tag);
     memset(dkey, 0, KEY_LEN);
 
     if (ct_len < 0) { free(ct); die_invalid(); }
@@ -569,8 +608,12 @@ static void cmd_read(DB *db, const char *username, const char *key,
         return;
     }
 
+    uint8_t aad[MAX_USERNAME + 1 + MAX_FILENAME + 1];
+    int aad_len = file_aad(fr->owner, fr->filename, aad);
+
     pt = xmalloc(fr->ct_len > 0 ? fr->ct_len : 1);
-    pt_len = gcm_decrypt(dkey, fr->iv, fr->ct, (int)fr->ct_len, fr->tag, pt);
+    pt_len = gcm_decrypt(dkey, fr->iv, aad, aad_len,
+                         fr->ct, (int)fr->ct_len, fr->tag, pt);
     memset(dkey, 0, KEY_LEN);
 
     if (pt_len < 0) { zfree(pt, fr->ct_len); die_invalid(); }
