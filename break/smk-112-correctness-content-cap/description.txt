@@ -1,0 +1,7 @@
+Correctness break: SMK caps file content at MAX_PAYLOAD_LEN = 4096 bytes
+(build/stor.c: `if (plaintext_len > MAX_PAYLOAD_LEN) return invalid;`), so a
+5000-byte write is rejected with exit 255. A correct stor accepts ordinary
+multi-kilobyte writes (memory is available; the spec only permits graceful
+failure on a *very large* write with no memory). The reference oracle writes the
+5000 bytes successfully (exit 0); SMK returns exit 255. Exit codes diverge ->
+spec deviation.
