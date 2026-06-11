@@ -1,0 +1,27 @@
+Integrity break against Husker_Bots (team 115) — re-registering a user
+overwrites their key material with no authentication, bricking their files.
+
+Root cause (build/stor.c, "register" action, lines ~473-491):
+
+    User *u = find_user(&db, user);
+    if (!u) { ... allocate new user ... }      // if user EXISTS, fall through
+    if (!RAND_bytes(u->key_salt, SALT_LEN)) ...;          // new random salt
+    if (!derive_key(key, strlen(key), u->key_salt, ...,
+                    u->key_hash, HASH_LEN)) ...;          // new key_hash
+
+register does not reject an existing username; when user1 already exists it
+keeps that record and overwrites key_salt + key_hash with values derived from
+the attacker-supplied key. No proof of the original key is required.
+
+After this, the file ciphertext for user1/file1 (encrypted under the key
+derived from the ORIGINAL key + ORIGINAL salt) can no longer be authenticated
+or decrypted: reading with the real key derives key(realkey, NEW salt), which
+does not match the stored hash, so auth fails.
+
+Exploit (single keyless command, runs on the provided enc.db):
+    stor -u user1 -k attacker register
+
+Verification (freshly built binary, provided enc.db): register returns rc=0 and
+rewrites enc.db. Reading user1/file1 afterwards with the original key returns
+"invalid" (rc 255) instead of the original INTEGRITY_FLAG. The grader re-reads
+user1/file1 with the real key and sees different content -> integrity break.
