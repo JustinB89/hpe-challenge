@@ -1,0 +1,15 @@
+Correctness break: register of an ALREADY-REGISTERED user must be rejected, but
+this target accepts it and silently overwrites the account, destroying the
+user's existing files.
+
+Sequence: register u1/key1; create f1; write f1="ORIG" (under key1);
+register u1/key2 (re-register, NO old key); read f1 with key1.
+
+Reference oracle: a correct stor rejects the 2nd register (exit 255, account
+unchanged), so reading f1 with key1 still returns "ORIG" (exit 0).
+Target: accepts the 2nd register (exit 0) and overwrites/wipes u1, so reading f1
+with the original key1 now returns "invalid" (exit 255).
+
+The outputs diverge (command 4 exit code, and command 5 stdout/exit), so this is
+a spec deviation. Allowing re-registration to clobber an existing account is also
+an account-takeover / data-loss flaw.
