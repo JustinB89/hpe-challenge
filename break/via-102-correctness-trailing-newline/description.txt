@@ -1,0 +1,19 @@
+Correctness break against via (team 102) — read appends a spurious trailing
+newline, so a file's content does not round-trip: writing "hello" and reading
+it back yields "hello\n" (6 bytes) instead of "hello" (5 bytes).
+
+Root cause (build/stor.c, do_read):
+
+    if (sf->len > 0 && fwrite(plain, 1, sf->len, stdout) != sf->len) { ... }
+    printf("\n");          // <-- always appended after the file content
+
+do_read unconditionally prints a '\n' after emitting the decrypted content (and
+also in the empty/never-written branch at line ~1209). The spec's read returns
+the stored content verbatim; the example `read -> "Hello"` shows no added
+newline, and the content written here contained no newline.
+
+Test: register alice, create notes, write "hello", read notes.
+  - Reference oracle prints exactly "hello" (the bytes that were written).
+  - via prints "hello\n".
+Outputs differ -> valid correctness break. The expected field ("hello") matches
+the oracle (the exact written content).
