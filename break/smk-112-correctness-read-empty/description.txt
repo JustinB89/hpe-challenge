@@ -1,0 +1,9 @@
+Correctness break: reading a file that was created but never written must
+succeed with empty content (exit 0), but this target returns "invalid" / exit
+255.
+
+Sequence: register alice; create file "notes"; read "notes" (no write).
+A created file has empty content; the reference oracle (and the majority of
+implementations) outputs nothing and exits 0. This target rejects the read with
+exit 255. The exit codes diverge -> spec deviation. (Exit-only assertion to
+avoid any output-formatting ambiguity.)
