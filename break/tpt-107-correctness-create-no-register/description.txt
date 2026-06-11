@@ -1,0 +1,15 @@
+Correctness break against TPT_Enterprise (team 107) — create succeeds for a
+user that was never registered.
+
+On a fresh database, running:
+    stor -u ghost -f f create
+TPT returns exit code 0 (success) and creates a file owned by "ghost", even
+though "ghost" has never been registered. A file must be owned by a real user;
+every other observed implementation (10 of 11, including the reference behavior)
+rejects create for a non-existent user with "invalid"/exit 255.
+
+Test: a single `create` for an unregistered user on a fresh db.
+  - Reference oracle rejects: exit 255 ("invalid").
+  - TPT accepts: exit 0.
+Exit codes differ -> valid correctness break. (Only the exit code is asserted to
+avoid any ambiguity in the exact "invalid" text/newline.)
