@@ -1,0 +1,26 @@
+Integrity break against TPT_Enterprise (team 107) — re-registering a user
+overwrites their salt/verifier with no authentication, bricking their files.
+
+Root cause (build/stor.c, register helper, lines ~254-267):
+
+    u = find_user(st, name);
+    if (!u) { ... allocate a new user ... }    // if user EXISTS, fall through
+    if (RAND_bytes(u->salt, SALT_LEN) != 1) return 0;     // new random salt
+    if (!derive_key(key, u->salt, derived)) return 0;
+    verifier_hex(name, derived, u->verifier);             // new verifier
+
+register does not reject an existing username; when user1 already exists it
+keeps that record and overwrites salt + verifier with values derived from the
+attacker-supplied key. No proof of the original key is required.
+
+After this, user1/file1's stored ciphertext (encrypted under the original
+derived key) can no longer be authenticated/decrypted with the real key,
+because the salt it depends on has been replaced.
+
+Exploit (single keyless command, runs on the provided enc.db):
+    stor -u user1 -k attacker register
+
+Verification (freshly built binary, provided enc.db): register returns rc=0 and
+rewrites enc.db. Reading user1/file1 afterwards with the original key returns
+"invalid" (rc 255) instead of the original INTEGRITY_FLAG. The grader re-reads
+user1/file1 with the real key and sees different content -> integrity break.
