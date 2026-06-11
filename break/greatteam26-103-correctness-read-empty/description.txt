@@ -1,0 +1,16 @@
+Correctness break against GreatTeam26 (team 103) — reading a file that was
+created but never written returns an error instead of empty content.
+
+Test: register alice, create file "notes", then read it (no write in between).
+  - A created file has empty content; reading it should succeed and output
+    nothing (exit 0). This is what the majority of implementations (8 of 11,
+    including the careful AEAD-based ones) and the reference behavior do.
+  - GreatTeam26 returns "invalid" / exit 255 for this read.
+
+Reference oracle: stdout "" with exit 0.
+GreatTeam26: "invalid" with exit 255.
+Outputs and exit codes differ -> valid correctness break.
+
+(Note: this is the spec-ambiguous "read a never-written file" case; the
+expected value asserts the empty/exit-0 behavior that the majority and a natural
+reading of "read a file's content" produce.)
