@@ -1,0 +1,33 @@
+Integrity break against SMK (team 112) — re-register overwrites a victim's
+account and destroys their files WITHOUT the key.
+
+Root cause (build/stor.c, the "register" action, ~lines 172-214):
+
+    int user_idx = -1;
+    for (i ...) if (active && strcmp(username, user)==0) user_idx = i;   // finds user1
+    ...
+    if (act_reg) {
+        if (user_idx == -1) { ... find a free slot ... }   // SKIPPED: user1 already exists
+        if (user_idx == -1) return invalid();              // not taken
+        user_record_t *u_rec = &db->users[user_idx];       // points at the EXISTING user1
+        memset(u_rec, 0, sizeof(user_record_t));           // <-- wipes user1 AND all its files
+        ... install attacker salt / key_hash_tag ...
+        fwrite(db ...);                                    // persisted
+        return 0;
+    }
+
+register never rejects an already-existing username. When the username already
+exists it keeps that record's index and memset()s the whole user_record_t —
+which embeds files[MAX_FILES_PER_USER] — then writes a fresh attacker-chosen
+key. No authentication is performed (register takes no existing key).
+
+Exploit: a single keyless command
+    stor -u user1 -k attacker-no-key-needed register
+overwrites user1, zeroing file1 (is_active=0) and replacing the key material.
+
+Verification (freshly built binary, against the provided enc.db):
+  - register returns rc=0 and rewrites enc.db (md5 changes).
+  - Reading user1/file1 afterwards with the ORIGINAL key returns "invalid"
+    (rc 255) instead of the original INTEGRITY_FLAG — the content is destroyed.
+The grader re-reads user1/file1 with the real key and sees content different
+from the original, so the integrity break is valid.
